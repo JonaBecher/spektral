@@ -34,11 +34,15 @@ class GNNExplainer:
     - `learning_rate`: learning rate when training the model;
     - `a_size_coef`: coefficient to control the number of edges of the subgraph that
     contributes to the prediction;
-    - `x_size_coef`: coefficient to control the number of features of the subgraph
+    - `x_size_coef`: coefficient to control the number of node features of the subgraph
+    that contributes to the prediction;
+    - `e_size_coef`: coefficient to control the number of edge features of the subgraph
     that contributes to the prediction;
     - `a_entropy_coef`: coefficient to control the discretization of the adjacency
     mask;
-    - `x_entropy_coef`: coefficient to control the discretization of the features
+    - `x_entropy_coef`: coefficient to control the discretization of the node features
+    mask;
+    - `e_entropy_coef`: coefficient to control the discretization of the edge features
     mask;
     - `laplacian_coef`: coefficient to control the graph Laplacian loss;
     """
@@ -53,9 +57,12 @@ class GNNExplainer:
         learning_rate=0.01,
         a_size_coef=0.0005,
         x_size_coef=0.1,
+        e_size_coef=0.1,
         a_entropy_coef=0.1,
         x_entropy_coef=0.1,
+        e_entropy_coef=0.1,
         laplacian_coef=0.0,
+        a = None
     ):
         self.model = model
 
@@ -76,15 +83,19 @@ class GNNExplainer:
         self.learning_rate = learning_rate
         self.a_size_coef = a_size_coef
         self.x_size_coef = x_size_coef
+        self.e_size_coef = e_size_coef
         self.a_entropy_coef = a_entropy_coef
         self.x_entropy_coef = x_entropy_coef
+        self.e_entropy_coef = e_entropy_coef
         self.laplacian_coef = laplacian_coef
+        self.a = a
 
-    def explain_node(self, x, a, node_idx=None, epochs=100):
+    def explain_node(self, x, a, e=None, node_idx=None, epochs=100):
         """
         Train the GNNExplainer to explain the given graph.
 
-        :param x: feature matrix of shape `(n_nodes, n_node_features)`;
+        :param x: node feature matrix of shape `(n_nodes, n_node_features)`;
+        :param e: edge feature matrix of shape `(n_edges, n_edge_features)`;
         :param a: sparse adjacency matrix of shape `(n_nodes, n_nodes)`;
         :param node_idx: index of the node to explain. If `self.graph_level=True`, this
         is ignored;
@@ -92,8 +103,12 @@ class GNNExplainer:
         :return:
         - `a_mask`: mask for the adjacency matrix;
         - `x_mask`: mask for the node features.
+        - `e_mask`: mask for the edge features.
         """
+        self.a = a
         x = tf.cast(x, tf.float32)
+        if e is not None:
+            e = tf.cast(e, tf.float32)
         if node_idx is None:
             node_idx = 0
 
@@ -101,12 +116,18 @@ class GNNExplainer:
         if self.graph_level:
             self.comp_graph = tf.cast(a, tf.float32)
             self.i = tf.zeros(x.shape[0], dtype=tf.int32)
-            self.y_pred = tf.argmax(self.model([x, a, self.i], training=False), axis=1)
+            if e is not None:
+                self.y_pred = tf.argmax(self.model([x, a, e, self.i], training=False), axis=1)
+            else:
+                self.y_pred = tf.argmax(self.model([x, a, self.i], training=False), axis=1)
         else:
             self.comp_graph = k_hop_sparse_subgraph(
                 a, node_idx, self.n_hops, self.preprocess
             )
-            self.y_pred = tf.argmax(self.model([x, a], training=False), axis=1)
+            if e is not None:
+                self.y_pred = tf.argmax(self.model([x, a, e], training=False), axis=1)
+            else:
+                self.y_pred = tf.argmax(self.model([x, a], training=False), axis=1)
 
         self.node_pred = self.y_pred[node_idx]
         self.y_pred = tf.cast(self.y_pred, tf.float32)
@@ -120,6 +141,12 @@ class GNNExplainer:
             dtype=tf.float32,
             trainable=True,
         )
+        if e is not None:
+            e_mask = tf.Variable(
+                tf.random.normal((1, e.shape[1]), stddev=0.1),
+                dtype=tf.float32,
+                trainable=True,
+            )
         a_mask = tf.Variable(
             tf.random.normal(
                 self.comp_graph.values.shape, stddev=(2 / x.shape[0]) ** 0.5
@@ -130,35 +157,84 @@ class GNNExplainer:
 
         # Training loop
         for i in range(epochs):
-            losses = self._train_step(x, a_mask, x_mask, node_idx)
+            if e is not None:
+                losses = self._train_step(x, a_mask, x_mask, node_idx, e, e_mask)
+            else:
+                losses = self._train_step(x, a_mask, x_mask, node_idx)
             if self.verbose:
                 print(", ".join([f"{key}: {val}" for key, val in losses.items()]))
 
+        if e is not None:
+            return a_mask, x_mask, e_mask
         return a_mask, x_mask
 
     @tf.function
-    def _train_step(self, x, a_mask, x_mask, node_idx):
+    def _train_step(self, x, a_mask, x_mask, node_idx, e=None, e_mask=None):
         with tf.GradientTape() as tape:
             masked_a = tf.sparse.map_values(
                 tf.multiply, self.comp_graph, tf.nn.sigmoid(a_mask)
             )
-            masked_x = x * tf.nn.sigmoid(x_mask)
+
+            if e is not None:
+                # remove unnecessary edge features
+                edge_list = [[i, j] for i, j in
+                             zip(*csr_matrix(np.array(tf.sparse.to_dense(self.a))).nonzero())]
+                edge_list_updated = [[i, j] for i, j in
+                                     zip(*csr_matrix(np.array(tf.sparse.to_dense(masked_a))).nonzero())]
+                edge_features_arr = np.array(e)
+                remaining_edge_features = []
+
+                for index, edge_list_item in enumerate(edge_list):
+                    if edge_list_item in edge_list_updated:
+                        remaining_edge_features.append(edge_features_arr[index])
+
+                e = tf.convert_to_tensor(remaining_edge_features, dtype=tf.float32)
+
+            # marginalize node features
+            std_tensor_x = tf.ones_like(x, dtype=tf.float32) / 2
+            mean_tensor_x = tf.zeros_like(x, dtype=tf.float32) - x
+            z_x = tf.random.normal(x.shape, mean=mean_tensor_x, stddev=std_tensor_x, seed=42)
+            masked_x = x + z_x * (1 - tf.nn.sigmoid(x_mask))
+
+            if e is not None:
+                # marginalize edge features
+                std_tensor_e = tf.ones_like(e, dtype=tf.float32) / 2
+                mean_tensor_e = tf.zeros_like(e, dtype=tf.float32) - e
+                z_e = tf.random.normal(e.shape, mean=mean_tensor_e, stddev=std_tensor_e, seed=42)
+                masked_e = e + z_e * (1 - tf.nn.sigmoid(e_mask))
 
             if self.graph_level:
-                pred = self.model([masked_x, masked_a, self.i], training=False)[
-                    0, self.node_pred
-                ]
+                if e is not None:
+                    pred = self.model([masked_x, masked_a, masked_e, self.i], training=False)[
+                        0, self.node_pred
+                    ]
+                else:
+                    pred = self.model([masked_x, masked_a, self.i], training=False)[
+                        0, self.node_pred
+                    ]
             else:
-                pred = self.model([masked_x, masked_a], training=False)[
-                    node_idx, self.node_pred
-                ]
+                if e is not None:
+                    pred = self.model([masked_x, masked_a, masked_e, self.i], training=False)[
+                        node_idx, self.node_pred
+                    ]
+                else:
+                    pred = self.model([masked_x, masked_a], training=False)[
+                        node_idx, self.node_pred
+                    ]
 
-            loss, losses = self._explain_loss_fn(pred, a_mask, x_mask)
-        grad = tape.gradient(loss, [a_mask, x_mask])
-        self.opt.apply_gradients(zip(grad, [a_mask, x_mask]))
+            if e is not None:
+                loss, losses = self._explain_loss_fn(pred, a_mask, x_mask, e_mask)
+            else:
+                loss, losses = self._explain_loss_fn(pred, a_mask, x_mask)
+        if e is not None:
+            grad = tape.gradient(loss, [a_mask, x_mask, e_mask])
+            self.opt.apply_gradients(zip(grad, [a_mask, x_mask, e_mask]))
+        else:
+            grad = tape.gradient(loss, [a_mask, x_mask])
+            self.opt.apply_gradients(zip(grad, [a_mask, x_mask]))
         return losses
 
-    def _explain_loss_fn(self, y_pred, a_mask, x_mask):
+    def _explain_loss_fn(self, y_pred, a_mask, x_mask, e_mask=None):
         mask = tf.nn.sigmoid(a_mask)
 
         # Prediction loss
@@ -188,13 +264,22 @@ class GNNExplainer:
             )
             smoothness_loss = self.laplacian_coef * quad_form
 
-        # Feature loss
+        # Node Feature loss
         mask = tf.nn.sigmoid(x_mask)
         x_size_loss = self.x_size_coef * tf.reduce_sum(mask)
         entropy = -mask * tf.math.log(mask + 1e-15) - (1 - mask) * tf.math.log(
             1 - mask + 1e-15
         )
         x_entropy_loss = self.x_entropy_coef * tf.reduce_mean(entropy)
+
+        if e_mask is not None:
+            # Edge feature loss
+            mask_edge = tf.nn.sigmoid(e_mask)
+            e_size_loss = self.e_size_coef * tf.reduce_sum(mask_edge)
+            entropy = -mask_edge * tf.math.log(mask_edge + 1e-15) - (1 - mask_edge) * tf.math.log(
+                1 - mask_edge + 1e-15
+            )
+            e_entropy_loss = self.e_entropy_coef * tf.reduce_mean(entropy)
 
         loss = (
             pred_loss
@@ -213,12 +298,24 @@ class GNNExplainer:
             "x_size_loss": x_size_loss,
             "x_entropy_loss": x_entropy_loss,
         }
+
+        if e_mask is not None:
+            loss = (
+                loss
+                + e_size_loss
+                + e_entropy_loss
+            )
+            losses["e_size_loss"] = e_size_loss
+            losses["e_entropy_loss"] = e_entropy_loss
+
         return loss, losses
 
-    def _explainer_cleaning(self, a_mask, x_mask, node_idx, a_thresh):
+    def _explainer_cleaning(self, a_mask, x_mask, node_idx, a_thresh, e_mask=None):
         # Get the masks
         selected_adj_mask = tf.nn.sigmoid(a_mask)
         selected_feat_mask = tf.nn.sigmoid(x_mask)
+        if e_mask is not None:
+            selected_edge_feat_mask = tf.nn.sigmoid(e_mask)
 
         # convert into a binary matrix
         if self.preprocess is not None:
@@ -250,15 +347,24 @@ class GNNExplainer:
                 selected_subgraph, node_idx, self.n_hops
             )
 
-        # the the top_feat relevant feature ids
+        # the the top_feat relevant node feature ids
         selected_features = tf.argsort(
             tf.nn.sigmoid(selected_feat_mask), direction="DESCENDING"
         )[0]
 
+        # the the top_feat relevant edge feature ids
+        if e_mask is not None:
+            selected_edge_feat_mask = tf.argsort(
+                tf.nn.sigmoid(selected_edge_feat_mask), direction="DESCENDING"
+            )[0]
+
+        if e_mask is not None:
+            return selected_subgraph, selected_features, selected_edge_feat_mask
+
         return selected_subgraph, selected_features
 
     def plot_subgraph(
-        self, a_mask, x_mask, node_idx=None, a_thresh=0.1, return_features=False
+        self, a_mask, x_mask, e_mask=None, node_idx=None, a_thresh=0.1, return_features=False
     ):
         """
         Plot the subgraph computed by the GNNExplainer.
@@ -266,15 +372,17 @@ class GNNExplainer:
         **Arguments**
         :param a_mask: the mask for the adjacency matrix computed by `explain_node`;
         :param x_mask: the mask for the node features computed by `explain_node`;
+        :param e_mask: the mask for the edge features computed by `explain_node`;
         :param node_idx: the same node index that was given to `explain_node`;
         :param a_thresh: threshold to remove low-importance edges;
-        :param return_features: if True, return indices to sort the nodes by their
+        :param return_features: if True, return indices to sort the nodes and edges by their
         importance.
         :return: The subgraph computed by GNNExplainer in Networkx format. If
         `return_features=True`, also returns an indices to sort the nodes by their
         importance.
         """
-        adj_mtx, top_ftrs = self._explainer_cleaning(a_mask, x_mask, node_idx, a_thresh)
+
+        adj_mtx, top_ftrs, e_mask = self._explainer_cleaning(a_mask, x_mask, node_idx, a_thresh, e_mask)
 
         edge_list = adj_mtx.indices.numpy()
         weights = adj_mtx.values
@@ -295,6 +403,8 @@ class GNNExplainer:
         )
 
         if return_features:
+            if e_mask is not None:
+                return G, top_ftrs, e_mask
             return G, top_ftrs
         else:
             return G
