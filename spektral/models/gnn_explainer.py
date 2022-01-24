@@ -382,7 +382,10 @@ class GNNExplainer:
         importance.
         """
 
-        adj_mtx, top_ftrs, e_mask = self._explainer_cleaning(a_mask, x_mask, node_idx, a_thresh, e_mask)
+        if e_mask is not None:
+            adj_mtx, top_ftrs, e_mask = self._explainer_cleaning(a_mask, x_mask, node_idx, a_thresh, e_mask)
+        else:
+            adj_mtx, top_ftrs = self._explainer_cleaning(a_mask, x_mask, node_idx, a_thresh)
 
         edge_list = adj_mtx.indices.numpy()
         weights = adj_mtx.values
